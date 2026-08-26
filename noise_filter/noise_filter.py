@@ -4,6 +4,16 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
+def load_images_from_folder(folder : str):
+    images = []
+    imagesName = []
+    for filename in os.listdir(folder):
+        img = cv2.imread(os.path.join(folder,filename), cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            images.append(img)
+            imagesName.append(filename.split(".")[0])
+    return images, imagesName
+
 def image_padding(image: np.ndarray, kernel_size: int) -> np.ndarray:
     """Pad the image in cyclic manner based on the kernel size."""
     pad_size = kernel_size // 2
@@ -57,20 +67,22 @@ def mid_point_filter(image_shape: tuple, image: np.ndarray, kernel_size: int = 3
     for i in range(pad_size, image_height - pad_size):
         for j in range(pad_size, image_width - pad_size):
             region = image[i - pad_size:i + pad_size + 1, j - pad_size:j + pad_size + 1]
-            filtered_image[i, j] = int((np.min(region) + np.max(region)) / 2)
+            min_pixel = int(np.min(region))
+            max_pixel = int(np.max(region))
+            filtered_image[i, j] = int((min_pixel + max_pixel) / 2)
     return filtered_image
 
 def main():
-    # Load the image
-    images = ["butterfly_gau.jpg", "butterfly_snp.jpg", "butterfly_str.jpg"]
-    for img_name in images:
-        image_path = Path(__file__).resolve().parent / "images" / "noised" / img_name
-        image_path = str(image_path)
-        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    # Load the images
+    noised_dir = Path(__file__).resolve().parent / "images" / "noised"
+    images, imagesName = load_images_from_folder(str(noised_dir))
+    print(f"Loaded {len(images)} images from {noised_dir}")
+    print(f"Image names: {imagesName}")
 
-        if image is None:
-            raise FileNotFoundError(f"Could not read image at {image_path}.\nCheck the path and file integrity.\nCurrent working directory: {os.getcwd()}")
-        
+    filtered_dir = Path(__file__).resolve().parent / "images" / "filtered"
+    filtered_dir.mkdir(parents=True, exist_ok=True)
+
+    for k, (image, img_name) in enumerate(zip(images, imagesName)):
         print(f"Loaded image shape: {image.shape}")
         print(f"Loaded image : {img_name}")
 
@@ -79,6 +91,16 @@ def main():
         mean_filtered = mean_filter(image.shape, padded_image, kernel_size=3)
         median_filtered = median_filter(image.shape, padded_image, kernel_size=3)
         mid_point_filtered = mid_point_filter(image.shape, padded_image, kernel_size=3)
+
+        base_name = Path(img_name).stem
+        mean_out = filtered_dir / f"{base_name}_mean.jpg"
+        median_out = filtered_dir / f"{base_name}_median.jpg"
+        midpoint_out = filtered_dir / f"{base_name}_midpoint.jpg"
+
+        cv2.imwrite(str(mean_out), np.clip(mean_filtered, 0, 255).astype(np.uint8))
+        cv2.imwrite(str(median_out), np.clip(median_filtered, 0, 255).astype(np.uint8))
+        cv2.imwrite(str(midpoint_out), np.clip(mid_point_filtered, 0, 255).astype(np.uint8))
+        
 
         # Display results
         plt.figure(figsize=(12, 8))
