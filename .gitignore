@@ -1,5 +1,7 @@
 .mvenv/**
+**.pdf
 **.zip
 
 noise_filter/images/filtered/**
 noise_filter/images/noised/**
+submissions/**
