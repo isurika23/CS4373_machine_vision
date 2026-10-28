@@ -1,4 +1,4 @@
-.mvenv/**
+mvenv/**
 **/debug/**
 
 canny_edge_detection/**.pdf

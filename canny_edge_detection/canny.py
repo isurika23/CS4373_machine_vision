@@ -123,10 +123,10 @@ if __name__ == "__main__":
     data_int_image = image.astype(np.float32)
     canny_image = canny(data_int_image)
 
-    # Save the edge image into ../edges/ relative to this script
-    edges_dir = Path(__file__).resolve().parent.parent / "edges"
+    # Save the edge image into edges/ inside this project, named after the input image
+    edges_dir = Path(__file__).resolve().parent / "edges"
     edges_dir.mkdir(parents=True, exist_ok=True)
-    output_path = str(edges_dir / "butterfly_edges.png")
+    output_path = str(edges_dir / f"{Path(image_path).stem}_edges.png")
     cv2.imwrite(output_path, canny_image)
 
     # Display the original image and the edges
