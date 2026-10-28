@@ -1,12 +1,5 @@
 """
-Machine Vision - Final Assignment
-Chain-code based grouping of objects under RST (rotation, scaling, translation) variations.
-
-Rule followed: OpenCV is used ONLY to read image files from disk.
-Every other operation (grey conversion, filtering, thresholding, contour tracking,
-chain coding, normalisation, grouping) is implemented from scratch with NumPy.
-
-Usage:
+    Run the image processing pipeline on a folder of images.
     python pipeline.py <input_folder> [--output output.txt] [--debug]
 """
 import argparse
@@ -27,7 +20,7 @@ def natural_sort_key(path: Path) -> list:
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", path.name)]
 
 def load_images(folder: str) -> list:
-    """ Load every .png / .jpg image in the folder.  Returns [(file_name, BGR image), ...]. """
+    """ Load every .png / .jpg image in the folder.  Returns [(file_name, grayscale image), ...]. """
     paths = [p for p in Path(folder).iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg")]
     images = []
     for path in sorted(paths, key=natural_sort_key):
@@ -73,10 +66,14 @@ def gaussian_kernel_1d(size: int, sigma: float) -> np.ndarray:
     kernel = np.exp(-(x ** 2) / (2 * sigma ** 2))
     return kernel / kernel.sum()
 
-def gaussian_filter(image: np.ndarray, kernel_size: int = 15, sigma: float = 3.0) -> np.ndarray:
+def gaussian_kernel_size(sigma: float) -> int:
+    """ Kernel must cover +-3 sigma (99.7 % of the bell curve): size = 2 * ceil(3 sigma) + 1 """
+    return 2 * int(np.ceil(3 * sigma)) + 1
+
+def gaussian_filter(image: np.ndarray, sigma: float = 3.0) -> np.ndarray:
     """ Gaussian filter - removes Gaussian noise while preserving edges better than mean filter
         Uses separable convolution: 2-D Gaussian = 1-D Gaussian in x * 1-D Gaussian in y """
-    g = gaussian_kernel_1d(kernel_size, sigma)
+    g = gaussian_kernel_1d(gaussian_kernel_size(sigma), sigma)
     smoothed = convolve2d(image, g.reshape(1, -1))      # horizontal pass
     smoothed = convolve2d(smoothed, g.reshape(-1, 1))   # vertical pass
     return smoothed
@@ -87,7 +84,9 @@ def reduce_noise(image: np.ndarray) -> np.ndarray:
             Median first (remove outliers so they are not smeared)
             then Gaussian (remove Gaussian noise) """
     denoised = median_filter(image, kernel_size=5)
-    denoised = gaussian_filter(denoised, kernel_size=15, sigma=3.0)
+    # Strong smoothing on purpose (sigma = 3 -> 19x19 kernel): only the silhouette is needed,
+    # so surface texture is smoothed away to avoid holes/specks after thresholding.
+    denoised = gaussian_filter(denoised, sigma=3.0)
     return np.clip(np.round(denoised), 0, 255).astype(np.uint8)
 
 
