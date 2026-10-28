@@ -1,6 +1,6 @@
 """
     Run the image processing pipeline on a folder of images.
-    python pipeline.py <input_folder> [--output output.txt] [--debug]
+    python pipeline.py <input_folder> [--output output.txt] [--debug] [--threshold 10]
 """
 import argparse
 import re
@@ -387,6 +387,75 @@ def canonical_code(candidates: list) -> list:
     return min(candidates)
 
 
+# =========================================== Grouping ============================================
+
+# ----------------------------------------- Code Distance -----------------------------------------
+
+def digit_difference(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """ Circular difference between code digits: 0 and 7 are 1 step apart, not 7.
+        d = min(|a - b|, 8 - |a - b|)  ->  0 (same turn) .. 4 (opposite turn) """
+    d = np.abs(a - b) % 8
+    return np.minimum(d, 8 - d)
+
+def code_distance(code_a: list, code_b: list) -> int:
+    """ Distance between two invariant codes: sum of digit differences, at the best circular
+        alignment. All shifts are tried because one changed digit can move the
+        smallest-integer start of an otherwise identical code """
+    a = np.array(code_a)
+    shifts = np.array([np.roll(code_b, s) for s in range(len(code_b))])   # every circular shift of b
+    return int(digit_difference(a, shifts).sum(axis=1).min())
+
+def chain_code_distance(candidates_a: list, candidates_b: list) -> int:
+    """ Distance between two objects: the closest pair among their candidate codes
+        (2 axis ends x 4 offsets each). Same shape -> one pair matches (almost) exactly """
+    return min(code_distance(a, b) for a in candidates_a for b in candidates_b)
+
+def distance_matrix(all_candidates: list) -> np.ndarray:
+    """ Symmetric matrix D[i, j] = chain-code distance between image i and image j """
+    n = len(all_candidates)
+    D = np.zeros((n, n), dtype=np.int64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            D[i, j] = D[j, i] = chain_code_distance(all_candidates[i], all_candidates[j])
+    return D
+
+# ------------------------------------------ Grouping ---------------------------------------------
+
+def find_root(parent: list, i: int) -> int:
+    """ Follow parent links up to the group's representative (union-find) """
+    while parent[i] != i:
+        parent[i] = parent[parent[i]]           # path halving keeps the trees short
+        i = parent[i]
+    return i
+
+def group_images(D: np.ndarray, threshold: int) -> list:
+    """ Two images are linked if their distance <= threshold; groups are the connected
+        components of these links. Returns a list of groups of image indices """
+    n = len(D)
+    parent = list(range(n))                     # every image starts in its own group
+    for i in range(n):
+        for j in range(i + 1, n):
+            if D[i, j] <= threshold:
+                parent[find_root(parent, j)] = find_root(parent, i)    # merge the two groups
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find_root(parent, i), []).append(i)
+    return list(groups.values())
+
+# --------------------------------------------- Output --------------------------------------------
+
+def write_output(path: Path, groups: list, results: list, threshold: int):
+    """ Text file: the groups of image names, then each image's invariant chain code """
+    lines = [f"Image groups (chain-code distance threshold = {threshold})", ""]
+    for k, group in enumerate(groups, start=1):
+        lines.append(f"Group {k}: {', '.join(results[i]['name'] for i in group)}")
+    lines += ["", "RST and starting-point invariant chain codes (32 digits):"]
+    width = max(len(r["name"]) for r in results)
+    for r in results:
+        lines.append(f"{r['name']:<{width}} : {''.join(map(str, r['invariant']))}")
+    path.write_text("\n".join(lines) + "\n")
+
+
 # --------------------------------- Debugging / Visualization -------------------------------------
 
 def save_stages(name: str, stages: list, out_dir: Path):
@@ -522,6 +591,30 @@ def save_aligned(result: dict, out_dir: Path):
     fig.savefig(out_dir / f"{Path(result['name']).stem}_aligned.png", dpi=100)
     plt.close(fig)
 
+def save_distance_matrix(D: np.ndarray, results: list, groups: list, threshold: int, out_dir: Path):
+    """Heat map of the chain-code distances; cells within the threshold are outlined."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    labels = [Path(r["name"]).stem for r in results]
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(D, cmap="viridis_r")
+    for i in range(len(D)):
+        for j in range(len(D)):
+            ax.text(j, i, str(D[i, j]), ha="center", va="center", fontsize=8,
+                    color="white" if D[i, j] > D.max() / 2 else "black")
+            if i != j and D[i, j] <= threshold:
+                ax.add_patch(plt.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False, ec="red", lw=1.5))
+    ax.set_xticks(range(len(D)))
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(D)))
+    ax.set_yticklabels(labels, fontsize=8)
+    group_text = "   ".join(f"G{k}: " + ",".join(labels[i].replace("im-", "") for i in g)
+                           for k, g in enumerate(groups, start=1))
+    ax.set_title(f"Chain-code distances (red = within threshold {threshold})\n{group_text}", fontsize=9)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="distance")
+    fig.tight_layout()
+    fig.savefig(out_dir / "distance_matrix.png", dpi=100)
+    plt.close(fig)
+
 def save_aligned_grid(results: list, out_dir: Path):
     """All aligned boundaries in one figure (4 per row), same scale so shapes can be compared."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -538,11 +631,13 @@ def save_aligned_grid(results: list, out_dir: Path):
 
 def main():
     """Main function: load images (grayscale) -> denoise -> segment -> chain code -> RST invariant code
-                     -> save debug images if requested. """
+                     -> group by chain-code distance -> write output file (+ debug images if requested). """
     parser = argparse.ArgumentParser(description="Group images of similar objects using RST-invariant chain codes.")
     parser.add_argument("input_folder", help="folder containing the .png / .jpg images")
     parser.add_argument("--output", default="output.txt", help="output text file")
     parser.add_argument("--debug", action="store_true", help="save intermediate images to ./debug")
+    parser.add_argument("--threshold", type=int, default=6,
+                        help="max chain-code distance for two images to be grouped (default 6)")
     args = parser.parse_args()
 
     images = load_images(args.input_folder)
@@ -570,10 +665,20 @@ def main():
             save_chain_code(result, Path("debug") / "chain_code")    # debug/chain_code/<name>_chain_code.png
             save_aligned(result, Path("debug") / "aligned")          # debug/aligned/<name>_aligned.png
 
+    # Grouping: compare every pair of images by their invariant candidate codes
+    D = distance_matrix([r["candidates"] for r in results])
+    groups = group_images(D, args.threshold)
+    write_output(Path(args.output), groups, results, args.threshold)
+    print(f"\nGroups (threshold = {args.threshold}):")
+    for k, group in enumerate(groups, start=1):
+        print(f"    Group {k}: {', '.join(results[i]['name'] for i in group)}")
+    print(f"Output written to {args.output}")
+
     if args.debug:
         save_histogram_grid(results, Path("debug"))                  # debug/histograms.png
         save_chain_code_grid(results, Path("debug"))                 # debug/chain_codes.png
         save_aligned_grid(results, Path("debug"))                    # debug/aligned.png
+        save_distance_matrix(D, results, groups, args.threshold, Path("debug"))   # debug/distance_matrix.png
 
 if __name__ == "__main__":
     main()
