@@ -1,7 +1,7 @@
 .mvenv/**
-**.pdf
 **/debug/**
 
+canny_edge_detection/**.pdf
 
 noise_filter/images/filtered/**
 noise_filter/images/noised/**
