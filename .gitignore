@@ -1,7 +1,13 @@
 .mvenv/**
 **.pdf
-**.zip
+**/debug/**
+
 
 noise_filter/images/filtered/**
 noise_filter/images/noised/**
 submissions/**
+
+Final_assignment/Samples/**
+**/output.txt
+
+.idea/**

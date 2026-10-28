@@ -1,0 +1,31 @@
+Develop a machine-vision pipeline that (you may use Python (preferred) or any other common programming language):
+
+1.      Loads `.png` and `.jpg` images from a folder specified by a command-line argument. Each image contains one object with foreground and background noise.
+
+2.      Processes each image by:
+
+o   Reducing Gaussian and outlier noise.
+
+o   Segmenting the object from the background through thresholding.
+
+o   Generating a 32-digit chain code representing the object boundary.
+
+o   Making the chain code invariant to rotation, scaling, translation (RST), and starting-point selection.
+
+3.      Groups images with similar objects despite RST variations based on the chain-code.
+
+4.      Save the output (i.e. grouped image file names) into a text file.
+
+Run your image using the sample images included in the file named “samples.zip”
+
+Write brief report describing the image processing / machine vision tasks used in your pipeline.  Use appropriate summarized pseudo code to describe algorithms where necessary.
+
+Create a ZIP file containing the following:
+
+·       Your source code
+
+·       Report
+
+·       Output text file
+
+Name your file as <<your_indexNo.zip” and upload before teh deadline
