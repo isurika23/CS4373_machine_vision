@@ -263,7 +263,7 @@ def trace_contour(mask: np.ndarray) -> np.ndarray:
 # --------------------------------------------- Chain Code ----------------------------------------
 
 def direction_code(d_row: float, d_col: float) -> int:
-    """ Freeman 8-direction code of a vector (Unit 7):  3 2 1 / 4 . 0 / 5 6 7
+    """ Freeman 8-direction code of a vector:  3 2 1 | 4 . 0 | 5 6 7
         i.e. 0 = East, then anti-clockwise in 45 degree steps. Image rows grow downwards,
         so the upward component is -d_row. The vector is rounded to the nearest direction. """
     angle = np.arctan2(-d_row, d_col)
@@ -282,27 +282,109 @@ def cumulative_perimeter(pixel_code: list) -> np.ndarray:
     step_lengths = [1.0 if c % 2 == 0 else np.sqrt(2) for c in pixel_code]
     return np.concatenate([[0.0], np.cumsum(step_lengths)])
 
-def subdivide_boundary(boundary: np.ndarray, segments: int = 32) -> np.ndarray:
+def subdivide_boundary(arc: np.ndarray, segments: int = 32, start_length: float = 0.0) -> np.ndarray:
     """ Method 3: divide the boundary into equal-length segments.
-        Returns the segments + 1 end points (the last one equals the first: closed boundary) """
-    arc = cumulative_perimeter(pixel_chain_code(boundary))
-    closed = np.vstack([boundary, boundary[:1]])
-    targets = np.arange(segments + 1) * arc[-1] / segments      # equally spaced lengths
+        arc = cumulative_perimeter of the boundary (computed once per image and reused).
+        start_length = distance along the boundary where the first cut is made (0 = first pixel).
+        Returns the indices of the segments + 1 end points (last = first: closed boundary) """
+    perimeter = arc[-1]
+    boundary_length = len(arc) - 1                             # arc has one entry per pixel + closing step
+    targets = (start_length + np.arange(segments + 1) * perimeter / segments) % perimeter
     indices = np.searchsorted(arc, targets)                    # first pixel at/after each length
-    indices = np.minimum(indices, len(closed) - 1)
-    return closed[indices]
+    return indices % boundary_length                           # index boundary_length = start pixel
 
 def segment_chain_code(points: np.ndarray) -> list:
     """ Join consecutive end points with straight lines and code each line's direction """
     steps = np.diff(points, axis=0)
     return [direction_code(d_row, d_col) for d_row, d_col in steps]
 
-def boundary_chain_code(mask: np.ndarray, segments: int = 32) -> (list, np.ndarray, np.ndarray):
+def boundary_chain_code(mask: np.ndarray, segments: int = 32) -> (list, np.ndarray, np.ndarray, np.ndarray):
     """ Object mask -> boundary -> 32 equal segments -> 32-digit chain code.
-        Returns (chain code, boundary pixels, segment end points) """
+        Returns (chain code, boundary pixels, segment end points, cumulative perimeter);
+        the cumulative perimeter is passed on to the invariance step so it is computed only once """
     boundary = trace_contour(mask)
-    points = subdivide_boundary(boundary, segments)
-    return segment_chain_code(points), boundary, points
+    arc = cumulative_perimeter(pixel_chain_code(boundary))
+    points = boundary[subdivide_boundary(arc, segments)]
+    return segment_chain_code(points), boundary, points, arc
+
+
+# ====================================== RST Invariance ===========================================
+
+# ---------------------------------- Orientation from Image Moments -------------------------------
+
+def raw_moment(mask: np.ndarray, p: int, q: int) -> float:
+    """ m_pq = sum_x sum_y x^p y^q  over the object pixels (binary image: f(x,y) = 1) """
+    rows, cols = np.nonzero(mask)
+    x, y = cols.astype(np.float64), rows.astype(np.float64)
+    return float(np.sum(x ** p * y ** q))
+
+def central_moments(mask: np.ndarray) -> (float, float, float, float, float):
+    """ Centroid x = m10/m00, y = m01/m00 and the 2nd-order central moments:
+            mu11 = m11 - y*m10,  mu20 = m20 - x*m10,  mu02 = m02 - y*m01
+        Central moments are measured about the centroid, so they are translation invariant """
+    m00, m10, m01 = raw_moment(mask, 0, 0), raw_moment(mask, 1, 0), raw_moment(mask, 0, 1)
+    x_bar, y_bar = m10 / m00, m01 / m00
+    mu11 = raw_moment(mask, 1, 1) - y_bar * m10
+    mu20 = raw_moment(mask, 2, 0) - x_bar * m10
+    mu02 = raw_moment(mask, 0, 2) - y_bar * m01
+    return x_bar, y_bar, mu20, mu02, mu11
+
+def principal_axis_angle(mu20: float, mu02: float, mu11: float) -> float:
+    """ Orientation of the major (longest) axis: theta = 1/2 * atan2(2 mu11, mu20 - mu02) """
+    return 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
+
+def align_boundary(boundary: np.ndarray, x_bar: float, y_bar: float, theta: float) -> np.ndarray:
+    """ Move the centroid to the origin and rotate by -theta, so the major axis lies along x.
+        After this every rotated copy of a shape has the same orientation (up to 180 degrees) """
+    x = boundary[:, 1] - x_bar
+    y = boundary[:, 0] - y_bar
+    x_rot = x * np.cos(theta) + y * np.sin(theta)
+    y_rot = -x * np.sin(theta) + y * np.cos(theta)
+    return np.stack([y_rot, x_rot], axis=1)                    # (row, col) like the boundary
+
+def major_axis_ends(aligned: np.ndarray) -> list:
+    """ Boundary pixels at the two ends of the major axis (largest and smallest x after alignment).
+        These are start points that do not depend on the object's rotation or position.
+        Both are kept because the axis direction is ambiguous by 180 degrees """
+    return [int(np.argmax(aligned[:, 1])), int(np.argmin(aligned[:, 1]))]
+
+# ------------------------------------- Chain Code Normalisation ----------------------------------
+
+def first_difference(code: list) -> list:
+    """ Rotation normalisation: C'_i = (C_i - C_(i-1)) mod 8, code treated as circular.
+        Counts the turns between segments instead of absolute directions """
+    return [(code[i] - code[i - 1]) % 8 for i in range(len(code))]
+
+def normalize_start_point(code: list) -> list:
+    """ Starting-point normalisation: the circular shift forming the smallest integer """
+    return min(code[i:] + code[:i] for i in range(len(code)))
+
+def invariant_chain_codes(mask: np.ndarray, boundary: np.ndarray, arc: np.ndarray, segments: int = 32,
+                          phases: int = 4) -> list:
+    """ RST and starting-point invariant chain codes of one object.
+            Translation : directions only + moments about the centroid
+            Scale       : fixed number of equal segments
+            Rotation    : boundary aligned to the major axis, then first difference
+            Start point : cuts start at a major-axis end, then smallest-integer shift
+        The cuts are also tried at `phases` offsets inside the first segment (0, 1/4, 1/2, 3/4),
+        because a small shift of the start pixel moves all 32 cuts.
+        arc = cumulative perimeter from boundary_chain_code (reused, not recomputed).
+        Returns all candidate codes (2 axis ends x phases); the grouping step compares these sets """
+    x_bar, y_bar, mu20, mu02, mu11 = central_moments(mask)
+    aligned = align_boundary(boundary, x_bar, y_bar, principal_axis_angle(mu20, mu02, mu11))
+    segment_length = arc[-1] / segments
+    candidates = []
+    for start in major_axis_ends(aligned):
+        for p in range(phases):
+            indices = subdivide_boundary(arc, segments, arc[start] + p * segment_length / phases)
+            code = segment_chain_code(aligned[indices])         # directions after alignment
+            candidates.append(normalize_start_point(first_difference(code)))
+    return candidates
+
+def canonical_code(candidates: list) -> list:
+    """ One representative code per object: the smallest integer among the candidates
+        (the same 'minimum magnitude' rule as the starting-point normalisation) """
+    return min(candidates)
 
 
 # --------------------------------- Debugging / Visualization -------------------------------------
@@ -320,48 +402,143 @@ def save_stages(name: str, stages: list, out_dir: Path):
     fig.savefig(out_dir / f"{Path(name).stem}_stages.png", dpi=80)
     plt.close(fig)
 
-def save_histogram(name: str, image: np.ndarray, threshold: float, out_dir: Path):
-    """Plot the raw and smoothed histogram with the selected threshold."""
-    out_dir.mkdir(parents=True, exist_ok=True)
+def make_grid(count: int, cell_width: float, cell_height: float, columns: int = 4):
+    """Figure with `columns` plots per row and as many rows as needed; unused cells are hidden."""
+    rows = int(np.ceil(count / columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(cell_width * columns, cell_height * rows),
+                             squeeze=False)
+    axes = axes.ravel()
+    for ax in axes[count:]:
+        ax.axis("off")
+    return fig, axes[:count]
+
+def plot_histogram(ax, name: str, image: np.ndarray, threshold: float, show_legend: bool):
+    """One panel: raw and smoothed histogram with the selected threshold."""
     raw = compute_histogram(image)
     smooth = smooth_histogram(smooth_histogram(raw))
-    fig, ax = plt.subplots(figsize=(6, 3.5))
     ax.plot(raw, color="lightgray", label="histogram")
     ax.plot(smooth, color="tab:blue", label="smoothed")
-    ax.axvline(threshold, color="tab:red", linestyle="--", label=f"T = {threshold:.0f}")
-    ax.set_xlabel("grey level")
-    ax.set_ylabel("pixel count")
-    ax.set_title(name)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_dir / f"{Path(name).stem}_histogram.png", dpi=80)
-    plt.close(fig)
+    ax.axvline(threshold, color="tab:red", linestyle="--", label="threshold")
+    ax.set_title(f"{name}  (T = {threshold:.0f})", fontsize=10)
+    ax.set_xlim(0, 255)
+    ax.set_xlabel("grey level", fontsize=8)
+    ax.set_ylabel("pixel count", fontsize=8)
+    ax.tick_params(labelsize=7)
+    if show_legend:
+        ax.legend(fontsize=7)
 
-def save_chain_code(name: str, image: np.ndarray, boundary: np.ndarray, points: np.ndarray,
-                    code: list, out_dir: Path):
-    """Draw the traced boundary, the 32 straight segments and each segment's code digit."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6, 6))
+def plot_chain_code(ax, name: str, image: np.ndarray, boundary: np.ndarray, points: np.ndarray,
+                    code: list, show_legend: bool):
+    """One panel: traced boundary, the 32 straight segments and each segment's code digit."""
     ax.imshow(image, cmap="gray", vmin=0, vmax=255)
     ax.plot(boundary[:, 1], boundary[:, 0], color="yellow", linewidth=1, label="traced boundary")
-    ax.plot(points[:, 1], points[:, 0], "-o", color="red", markersize=3, linewidth=1.5,
+    ax.plot(points[:, 1], points[:, 0], "-o", color="red", markersize=2, linewidth=1.2,
             label="32 segments")
-    ax.plot(points[0, 1], points[0, 0], "s", color="cyan", markersize=8, label="start")
+    ax.plot(points[0, 1], points[0, 0], "s", color="cyan", markersize=6, label="start")
     for k, digit in enumerate(code):
         mid = (points[k] + points[k + 1]) / 2
-        ax.text(mid[1], mid[0], str(digit), color="white", fontsize=9, ha="center", va="center",
-                bbox=dict(boxstyle="round,pad=0.15", fc="black", alpha=0.6))
-    ax.set_title(f"{name}: {''.join(map(str, code))}", fontsize=9)
-    ax.legend(loc="lower right", fontsize=7)
+        ax.text(mid[1], mid[0], str(digit), color="white", fontsize=6, ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.1", fc="black", alpha=0.6))
+    ax.set_title(f"{name}\n{''.join(map(str, code))}", fontsize=8, family="monospace")
     ax.axis("off")
+    if show_legend:
+        ax.legend(loc="lower right", fontsize=6)
+
+def save_histogram(result: dict, out_dir: Path):
+    """One image's histogram as its own file: out_dir/<image name>.png"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    plot_histogram(ax, result["name"], result["denoised"], result["threshold"], show_legend=True)
     fig.tight_layout()
-    fig.savefig(out_dir / f"{Path(name).stem}_chaincode.png", dpi=80)
+    fig.savefig(out_dir / f"{Path(result['name']).stem}_histogram.png", dpi=80)
+    plt.close(fig)
+
+def save_chain_code(result: dict, out_dir: Path):
+    """One image's chain-code drawing as its own file: out_dir/<image name>.png"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    plot_chain_code(ax, result["name"], result["image"], result["boundary"], result["points"],
+                    result["code"], show_legend=True)
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{Path(result['name']).stem}_chain_code.png", dpi=100)
+    plt.close(fig)
+
+def save_histogram_grid(results: list, out_dir: Path):
+    """All histograms in one figure (4 per row)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = make_grid(len(results), cell_width=4.5, cell_height=3.2)
+    for k, (ax, r) in enumerate(zip(axes, results)):
+        plot_histogram(ax, r["name"], r["denoised"], r["threshold"], show_legend=(k == 0))
+    fig.suptitle("Histograms of the denoised images and selected thresholds")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_dir / "histograms.png", dpi=80)
+    plt.close(fig)
+
+def save_chain_code_grid(results: list, out_dir: Path):
+    """All chain-code drawings in one figure (4 per row)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = make_grid(len(results), cell_width=4.5, cell_height=4.5)
+    for k, (ax, r) in enumerate(zip(axes, results)):
+        plot_chain_code(ax, r["name"], r["image"], r["boundary"], r["points"], r["code"],
+                        show_legend=(k == 0))
+    fig.suptitle("Traced boundaries and 32-segment chain codes")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))       # leave room for the title
+    fig.savefig(out_dir / "chain_codes.png", dpi=120)   # higher dpi so the digits are readable
+    plt.close(fig)
+
+def plot_aligned(ax, name: str, mask: np.ndarray, boundary: np.ndarray, arc: np.ndarray,
+                 invariant: list, show_legend: bool):
+    """One panel: boundary after major-axis alignment, the axis, its two ends and the 32 cuts
+    (first axis end, phase 0), titled with the canonical invariant code."""
+    x_bar, y_bar, mu20, mu02, mu11 = central_moments(mask)
+    aligned = align_boundary(boundary, x_bar, y_bar, principal_axis_angle(mu20, mu02, mu11))
+    aligned = aligned / np.sqrt(mask.sum())                   # common scale for comparison
+    ends = major_axis_ends(aligned)
+    start = ends[0]
+    cuts = aligned[subdivide_boundary(arc, 32, arc[start])]
+    ax.plot(aligned[:, 1], aligned[:, 0], color="goldenrod", linewidth=1, label="aligned boundary")
+    ax.plot(cuts[:, 1], cuts[:, 0], "-o", color="red", markersize=2, linewidth=1, label="32 segments")
+    ax.axhline(0, color="gray", linestyle="--", linewidth=0.8, label="major axis")
+    ax.plot(aligned[ends, 1], aligned[ends, 0], "s", color="tab:blue", markersize=6,
+            label="axis ends (start points)")
+    ax.plot(0, 0, "+", color="black", markersize=8)
+    ax.set_aspect("equal")
+    ax.invert_yaxis()                                          # image convention: rows downwards
+    ax.set_xlim(-0.85, 0.85)
+    ax.set_ylim(0.85, -0.85)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(f"{name}\n{''.join(map(str, invariant))}", fontsize=8, family="monospace")
+    if show_legend:
+        ax.legend(loc="lower right", fontsize=6)
+
+def save_aligned(result: dict, out_dir: Path):
+    """One image's aligned boundary as its own file: out_dir/<image name>.png"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5, 5))
+    plot_aligned(ax, result["name"], result["mask"], result["boundary"], result["arc"], result["invariant"],
+                 show_legend=True)
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{Path(result['name']).stem}_aligned.png", dpi=100)
+    plt.close(fig)
+
+def save_aligned_grid(results: list, out_dir: Path):
+    """All aligned boundaries in one figure (4 per row), same scale so shapes can be compared."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, axes = make_grid(len(results), cell_width=4.0, cell_height=4.0)
+    for k, (ax, r) in enumerate(zip(axes, results)):
+        plot_aligned(ax, r["name"], r["mask"], r["boundary"], r["arc"], r["invariant"],
+                     show_legend=(k == 0))
+    fig.suptitle("Boundaries aligned to the major axis, with RST + start-point invariant codes")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_dir / "aligned.png", dpi=110)
     plt.close(fig)
 
 # ========================================= Main Function =========================================
 
 def main():
-    """Main function: load images (grayscale) -> denoise -> segment -> chain code -> save debug images if requested. """
+    """Main function: load images (grayscale) -> denoise -> segment -> chain code -> RST invariant code
+                     -> save debug images if requested. """
     parser = argparse.ArgumentParser(description="Group images of similar objects using RST-invariant chain codes.")
     parser.add_argument("input_folder", help="folder containing the .png / .jpg images")
     parser.add_argument("--output", default="output.txt", help="output text file")
@@ -371,18 +548,32 @@ def main():
     images = load_images(args.input_folder)
     print(f"Loaded {len(images)} images from {args.input_folder}")
 
+    results = []
     for name, image in images:
         denoised = reduce_noise(image)
         mask, binary, threshold = segment_object(denoised)
-        code, boundary, points = boundary_chain_code(mask, segments=32)
-        print(f"{name}: T = {threshold:.0f}, area = {int(mask.sum())} px, "
-              f"boundary = {len(boundary)} px, chain code = {''.join(map(str, code))}")
+        code, boundary, points, arc = boundary_chain_code(mask, segments=32)
+        candidates = invariant_chain_codes(mask, boundary, arc, segments=32, phases=4)
+        invariant = canonical_code(candidates)
+        print(f"{name}: T = {threshold:.0f}, area = {int(mask.sum())} px, boundary = {len(boundary)} px")
+        print(f"    chain code     = {''.join(map(str, code))}")
+        print(f"    invariant code = {''.join(map(str, invariant))}")
+        result = {"name": name, "image": image, "denoised": denoised, "threshold": threshold,
+                  "mask": mask, "boundary": boundary, "arc": arc, "points": points, "code": code,
+                  "candidates": candidates, "invariant": invariant}
+        results.append(result)
         if args.debug:
             save_stages(name, [("Original", image), ("Denoised", denoised),
                                (f"Thresholded (T={threshold:.0f})", binary), ("Object mask", mask)],
-                        Path("debug"))
-            save_histogram(name, denoised, threshold, Path("debug"))
-            save_chain_code(name, image, boundary, points, code, Path("debug"))
+                        Path("debug") / "stages")                    # debug/stages/<name>_stages.png
+            save_histogram(result, Path("debug") / "histogram")      # debug/histogram/<name>_histogram.png
+            save_chain_code(result, Path("debug") / "chain_code")    # debug/chain_code/<name>_chain_code.png
+            save_aligned(result, Path("debug") / "aligned")          # debug/aligned/<name>_aligned.png
+
+    if args.debug:
+        save_histogram_grid(results, Path("debug"))                  # debug/histograms.png
+        save_chain_code_grid(results, Path("debug"))                 # debug/chain_codes.png
+        save_aligned_grid(results, Path("debug"))                    # debug/aligned.png
 
 if __name__ == "__main__":
     main()
