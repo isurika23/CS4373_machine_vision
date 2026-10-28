@@ -95,8 +95,7 @@ def reduce_noise(image: np.ndarray) -> np.ndarray:
 
 # ----------------------------------------- Histogram ---------------------------------------------
 
-# 8-neighbour offsets (d_row, d_col) in the contour-tracking order of Unit 6:  6 7 0 / 5 . 1 / 4 3 2
-NEIGHBOURS_8 = [(-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0)]
+NEIGHBOURS_8 = [(-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0)] # order for contour tracking
 NEIGHBOURS_4 = [(-1, 0), (0, 1), (1, 0), (0, -1)]
 
 def compute_histogram(image: np.ndarray) -> np.ndarray:
@@ -211,6 +210,8 @@ def fill_holes(binary: np.ndarray) -> np.ndarray:
                 stack.append((ny, nx))
     return (~outside).astype(np.uint8)
 
+# ------------------------------------- Segmentation Pipeline -------------------------------------
+
 def segment_object(image: np.ndarray) -> (np.ndarray, np.ndarray, float):
     """ Segmentation: histogram -> smooth -> valley threshold -> binary image -> clean-up.
         Returns (object mask, raw thresholded image, threshold) """
@@ -222,6 +223,86 @@ def segment_object(image: np.ndarray) -> (np.ndarray, np.ndarray, float):
     mask = largest_component(mask)
     mask = fill_holes(mask)
     return mask, binary, threshold
+
+
+# ===================================== Boundary Representation ===================================
+
+# ------------------------------------------ Contour Tracking -------------------------------------
+
+def trace_contour(mask: np.ndarray) -> np.ndarray:
+    """ Contour tracking: 8-connected boundary pixels are traced in clockwise order.
+            1. first boundary pixel = first object pixel found scanning from the top-left corner
+            2. store it as the start point and set n = 1
+            3. check direction m = (n - 2) mod 8
+            4. if that pixel is object: move there, n = m, go to 3; otherwise m = (m + 1) mod 8
+            5. stop when the start point is reached as the next pixel
+        Returns the boundary pixels in order (clockwise) as an array of (row, col) """
+    padded = np.pad(mask, 1)                    # neighbours of edge pixels always exist
+    rows, cols = np.nonzero(padded)
+    first = np.lexsort((cols, rows))[0]         # smallest row, then smallest column
+    start = (rows[first], cols[first])
+
+    boundary = [start]
+    current, n = start, 1
+    while True:
+        m = (n - 2) % 8
+        for _ in range(8):
+            dy, dx = NEIGHBOURS_8[m]
+            candidate = (current[0] + dy, current[1] + dx)
+            if padded[candidate]:
+                break
+            m = (m + 1) % 8
+        else:
+            break                               # isolated single pixel: no neighbours
+        if candidate == start:
+            break
+        boundary.append(candidate)
+        current, n = candidate, m
+    return np.array(boundary) - 1               # undo the padding offset
+
+# --------------------------------------------- Chain Code ----------------------------------------
+
+def direction_code(d_row: float, d_col: float) -> int:
+    """ Freeman 8-direction code of a vector (Unit 7):  3 2 1 / 4 . 0 / 5 6 7
+        i.e. 0 = East, then anti-clockwise in 45 degree steps. Image rows grow downwards,
+        so the upward component is -d_row. The vector is rounded to the nearest direction. """
+    angle = np.arctan2(-d_row, d_col)
+    return int(np.round(angle / (np.pi / 4))) % 8
+
+def pixel_chain_code(boundary: np.ndarray) -> list:
+    """ Method 1 chain code: one direction per pair of neighbouring boundary pixels
+        (the closed boundary, so the last pixel connects back to the first) """
+    closed = np.vstack([boundary, boundary[:1]])
+    steps = np.diff(closed, axis=0)
+    return [direction_code(d_row, d_col) for d_row, d_col in steps]
+
+def cumulative_perimeter(pixel_code: list) -> np.ndarray:
+    """ Perimeter from the chain code: even codes add 1, odd (diagonal) codes add sqrt(2).
+        Returns the running length along the boundary, starting at 0 """
+    step_lengths = [1.0 if c % 2 == 0 else np.sqrt(2) for c in pixel_code]
+    return np.concatenate([[0.0], np.cumsum(step_lengths)])
+
+def subdivide_boundary(boundary: np.ndarray, segments: int = 32) -> np.ndarray:
+    """ Method 3: divide the boundary into equal-length segments.
+        Returns the segments + 1 end points (the last one equals the first: closed boundary) """
+    arc = cumulative_perimeter(pixel_chain_code(boundary))
+    closed = np.vstack([boundary, boundary[:1]])
+    targets = np.arange(segments + 1) * arc[-1] / segments      # equally spaced lengths
+    indices = np.searchsorted(arc, targets)                    # first pixel at/after each length
+    indices = np.minimum(indices, len(closed) - 1)
+    return closed[indices]
+
+def segment_chain_code(points: np.ndarray) -> list:
+    """ Join consecutive end points with straight lines and code each line's direction """
+    steps = np.diff(points, axis=0)
+    return [direction_code(d_row, d_col) for d_row, d_col in steps]
+
+def boundary_chain_code(mask: np.ndarray, segments: int = 32) -> (list, np.ndarray, np.ndarray):
+    """ Object mask -> boundary -> 32 equal segments -> 32-digit chain code.
+        Returns (chain code, boundary pixels, segment end points) """
+    boundary = trace_contour(mask)
+    points = subdivide_boundary(boundary, segments)
+    return segment_chain_code(points), boundary, points
 
 
 # --------------------------------- Debugging / Visualization -------------------------------------
@@ -256,8 +337,31 @@ def save_histogram(name: str, image: np.ndarray, threshold: float, out_dir: Path
     fig.savefig(out_dir / f"{Path(name).stem}_histogram.png", dpi=80)
     plt.close(fig)
 
+def save_chain_code(name: str, image: np.ndarray, boundary: np.ndarray, points: np.ndarray,
+                    code: list, out_dir: Path):
+    """Draw the traced boundary, the 32 straight segments and each segment's code digit."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(image, cmap="gray", vmin=0, vmax=255)
+    ax.plot(boundary[:, 1], boundary[:, 0], color="yellow", linewidth=1, label="traced boundary")
+    ax.plot(points[:, 1], points[:, 0], "-o", color="red", markersize=3, linewidth=1.5,
+            label="32 segments")
+    ax.plot(points[0, 1], points[0, 0], "s", color="cyan", markersize=8, label="start")
+    for k, digit in enumerate(code):
+        mid = (points[k] + points[k + 1]) / 2
+        ax.text(mid[1], mid[0], str(digit), color="white", fontsize=9, ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.15", fc="black", alpha=0.6))
+    ax.set_title(f"{name}: {''.join(map(str, code))}", fontsize=9)
+    ax.legend(loc="lower right", fontsize=7)
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{Path(name).stem}_chaincode.png", dpi=80)
+    plt.close(fig)
+
+# ========================================= Main Function =========================================
+
 def main():
-    """Main function: load images (grayscale) -> denoise -> segment -> save debug images if requested. """
+    """Main function: load images (grayscale) -> denoise -> segment -> chain code -> save debug images if requested. """
     parser = argparse.ArgumentParser(description="Group images of similar objects using RST-invariant chain codes.")
     parser.add_argument("input_folder", help="folder containing the .png / .jpg images")
     parser.add_argument("--output", default="output.txt", help="output text file")
@@ -270,13 +374,15 @@ def main():
     for name, image in images:
         denoised = reduce_noise(image)
         mask, binary, threshold = segment_object(denoised)
-        print(f"{name}: {image.shape[1]}x{image.shape[0]}, threshold T = {threshold:.0f}, "
-              f"object area = {int(mask.sum())} px")
+        code, boundary, points = boundary_chain_code(mask, segments=32)
+        print(f"{name}: T = {threshold:.0f}, area = {int(mask.sum())} px, "
+              f"boundary = {len(boundary)} px, chain code = {''.join(map(str, code))}")
         if args.debug:
             save_stages(name, [("Original", image), ("Denoised", denoised),
                                (f"Thresholded (T={threshold:.0f})", binary), ("Object mask", mask)],
                         Path("debug"))
             save_histogram(name, denoised, threshold, Path("debug"))
+            save_chain_code(name, image, boundary, points, code, Path("debug"))
 
 if __name__ == "__main__":
     main()
