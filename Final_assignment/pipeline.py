@@ -1,7 +1,5 @@
-"""
-    Run the image processing pipeline on a folder of images.
-    python pipeline.py <input_folder> [--output output.txt] [--debug] [--threshold 10]
-"""
+#Run command (windows): python pipeline.py <input_folder> [--output output.txt] [--debug] [--threshold 10]
+
 import argparse
 import re
 from pathlib import Path
